@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=AlertManager Monitor
+Comment=Monitor Prometheus Alertmanager for active alerts
+Exec=SCRIPT_PATH
+Icon=ICON_PATH
+Terminal=false
+Categories=System;Monitor;
+Keywords=prometheus;alertmanager;monitoring;alerts;
+StartupNotify=false
