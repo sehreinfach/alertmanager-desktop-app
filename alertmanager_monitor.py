@@ -10,8 +10,11 @@ Panel indicator behaviour:
   • Flashing red  → active alerts
   • Grey ⏸       → paused
 
-Left-click  → open/close the alert detail window
-Right-click → context menu  (Pause / Resume, Check now, Quit)
+Left-click        → open/close the alert detail window
+Right-click       → context menu  (Pause / Resume, Check now, Quit)
+Middle-click/drag → drag the indicator to any desktop position
+                    Position is saved to conf.json and restored on restart.
+                    Right-click → "Reset to panel" snaps it back to the panel.
 """
 
 import gi
@@ -46,6 +49,9 @@ DEFAULT_CONFIG = {
     "check_interval":   30,
     "sound_enabled":    True,
     "sound_file":       "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga",
+    # Floating indicator position — None means "auto-place in panel"
+    "indicator_x":      None,
+    "indicator_y":      None,
 }
 
 # Panel geometry (read once at start from dconf; fall back to 48 px at bottom)
@@ -156,17 +162,29 @@ class SoundPlayer:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Panel Indicator window
+#  Panel Indicator window  (now freely draggable)
 # ══════════════════════════════════════════════════════════════════════════════
 class PanelIndicator:
     """
-    A small borderless DOCK window that sits in the panel.
+    A small borderless DOCK window that sits in the panel by default.
+
+    Dragging:
+      Hold left button and move the mouse to reposition the indicator anywhere
+      on the desktop.  The position is saved to conf.json and restored on the
+      next start.  The indicator must be moved more than DRAG_THRESHOLD pixels
+      before it is considered a drag (so short clicks still open the window).
+
+    Reset:
+      "Reset to panel position" in the right-click context menu snaps the
+      indicator back to its default panel corner and clears the saved position.
+
     On X11 / GNOME Shell (both vanilla and dash-to-panel) a DOCK-type window
     is always on top and not included in the window list.
     """
 
-    _FLASH_MS  = 600
-    _MARGIN_R  = 4    # px gap from right screen edge
+    _FLASH_MS       = 600
+    _MARGIN_R       = 4     # px gap from right screen edge (default position)
+    _DRAG_THRESHOLD = 5     # pixels of movement before drag mode activates
 
     # colours
     _COL_NORMAL = "#3d3d3d"
@@ -182,6 +200,14 @@ class PanelIndicator:
         self._flash_timer = None
         self._alert_count = 0
         self._tooltip_txt = APP_NAME
+
+        # ── drag state ─────────────────────────────────────────────────────────
+        self._drag_active      = False   # True once threshold exceeded
+        self._drag_btn_held    = False   # True while button 1 is held
+        self._drag_start_x     = 0       # pointer X at button-press (screen)
+        self._drag_start_y     = 0       # pointer Y at button-press (screen)
+        self._drag_win_start_x = 0       # window X at button-press
+        self._drag_win_start_y = 0       # window Y at button-press
 
         # ── window ─────────────────────────────────────────────────────────────
         self._win = Gtk.Window(type=Gtk.WindowType.POPUP)
@@ -205,9 +231,16 @@ class PanelIndicator:
         """)
         ctx.add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        # ── event box (catches clicks) ─────────────────────────────────────────
+        # ── event box (catches clicks & motion) ────────────────────────────────
         self._ebox = Gtk.EventBox()
-        self._ebox.connect("button-press-event", self._on_click)
+        self._ebox.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK   |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        self._ebox.connect("button-press-event",   self._on_button_press)
+        self._ebox.connect("button-release-event", self._on_button_release)
+        self._ebox.connect("motion-notify-event",  self._on_motion)
         self._win.add(self._ebox)
 
         # ── drawing area ───────────────────────────────────────────────────────
@@ -226,15 +259,35 @@ class PanelIndicator:
         self._win.show_all()
 
     # ── positioning ────────────────────────────────────────────────────────────
-    def _position(self):
+    def _default_panel_xy(self):
+        """Return (x, y) for the default panel-corner position."""
         display = Gdk.Display.get_default()
         monitor = display.get_monitor(0)
         geo     = monitor.get_geometry()
         sw, sh  = geo.width, geo.height
         x = sw - INDICATOR_W - self._MARGIN_R
         y = sh - PANEL_HEIGHT if PANEL_POSITION == "BOTTOM" else 0
+        return x, y
+
+    def _position(self):
+        """Place the window: use saved position if available, else panel corner."""
+        cfg = self.app.config
+        sx = cfg.get("indicator_x")
+        sy = cfg.get("indicator_y")
+        if sx is not None and sy is not None:
+            x, y = int(sx), int(sy)
+        else:
+            x, y = self._default_panel_xy()
         self._win.move(x, y)
         self._win.resize(INDICATOR_W, PANEL_HEIGHT)
+
+    def reset_to_panel(self):
+        """Snap the indicator back to the default panel position and clear the saved pos."""
+        x, y = self._default_panel_xy()
+        self._win.move(x, y)
+        self.app.config["indicator_x"] = None
+        self.app.config["indicator_y"] = None
+        save_config(self.app.config)
 
     # ── icon loading ───────────────────────────────────────────────────────────
     def _load_pb(self, name: str):
@@ -268,6 +321,18 @@ class PanelIndicator:
         cr.set_source_rgba(r, g, b, 0.92)
         cr.fill()
 
+        # drag-handle grip dots (three vertical pairs on the left edge)
+        grip_alpha = 0.55 if self._drag_active else 0.30
+        cr.set_source_rgba(1, 1, 1, grip_alpha)
+        dot_r  = 1.5
+        gx     = 5.5          # horizontal centre of grip dots
+        for col in range(2):
+            cx = gx + col * 5
+            for row in range(3):
+                cy = h * 0.25 + row * (h * 0.25)
+                cr.arc(cx, cy, dot_r, 0, 6.28318)
+                cr.fill()
+
         # icon
         icon_key = "paused" if self._state == "paused" else \
                    ("alert" if (self._state == "alert" and self._flash_on)
@@ -277,7 +342,7 @@ class PanelIndicator:
         if pb:
             icon_w = pb.get_width()
             icon_h = pb.get_height()
-            ix = 8
+            ix = 20           # shifted right a bit to leave room for grip dots
             iy = (h - icon_h) / 2
             import gi as _gi
             from gi.repository import Gdk as _Gdk
@@ -296,19 +361,67 @@ class PanelIndicator:
         cr.select_font_face("Sans", 0, 1)   # bold
         font_size = max(h * 0.32, 11)
         cr.set_font_size(font_size)
-        tx = icon_w + 12
+        tx = icon_w + 24      # account for grip dots + icon offset
         ty = h * 0.65
         cr.move_to(tx, ty)
         cr.show_text(label)
 
         return False
 
-    # ── click handler ──────────────────────────────────────────────────────────
-    def _on_click(self, widget, event):
+    # ── drag logic ─────────────────────────────────────────────────────────────
+    def _on_button_press(self, widget, event):
         if event.button == 1:
-            self.app.toggle_main_window()
+            self._drag_btn_held    = True
+            self._drag_active      = False
+            self._drag_start_x     = event.x_root
+            self._drag_start_y     = event.y_root
+            wx, wy = self._win.get_position()
+            self._drag_win_start_x = wx
+            self._drag_win_start_y = wy
+        elif event.button == 3:
+            # Right-click: handled on release to avoid conflict with drag
+            pass
+        return True
+
+    def _on_button_release(self, widget, event):
+        if event.button == 1:
+            was_drag = self._drag_active
+            self._drag_btn_held = False
+            self._drag_active   = False
+            self._redraw()      # clear drag highlight
+
+            if was_drag:
+                # Save the new position to config
+                x, y = self._win.get_position()
+                self.app.config["indicator_x"] = x
+                self.app.config["indicator_y"] = y
+                save_config(self.app.config)
+            else:
+                # Short click → toggle main window
+                self.app.toggle_main_window()
+
         elif event.button == 3:
             self.app.show_tray_menu(int(event.x_root), int(event.y_root))
+
+        return True
+
+    def _on_motion(self, widget, event):
+        if not self._drag_btn_held:
+            return False
+
+        dx = event.x_root - self._drag_start_x
+        dy = event.y_root - self._drag_start_y
+
+        if not self._drag_active:
+            if (dx * dx + dy * dy) >= self._DRAG_THRESHOLD ** 2:
+                self._drag_active = True
+                self._redraw()   # brighten grip dots while dragging
+
+        if self._drag_active:
+            nx = int(self._drag_win_start_x + dx)
+            ny = int(self._drag_win_start_y + dy)
+            self._win.move(nx, ny)
+
         return True
 
     # ── public state API ───────────────────────────────────────────────────────
@@ -654,6 +767,13 @@ class AlertMonitorApp:
 
         menu.append(Gtk.SeparatorMenuItem())
 
+        # ── indicator position sub-section ─────────────────────────────────────
+        i_reset = Gtk.MenuItem(label="⊹ Reset indicator to panel position")
+        i_reset.connect("activate", lambda _: self._indicator.reset_to_panel())
+        menu.append(i_reset)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
         if self._last_error:
             lbl_s = f"Error: {self._last_error[:50]}"
         else:
@@ -674,6 +794,9 @@ class AlertMonitorApp:
 
     # ── config ─────────────────────────────────────────────────────────────────
     def apply_config(self, cfg: dict):
+        # Preserve indicator position when saving from Settings dialog
+        cfg.setdefault("indicator_x", self.config.get("indicator_x"))
+        cfg.setdefault("indicator_y", self.config.get("indicator_y"))
         self.config = cfg
         save_config(cfg)
         self._schedule(delay_ms=500)

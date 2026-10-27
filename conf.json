@@ -4,5 +4,8 @@
     "password": "password",
     "check_interval": 30,
     "sound_enabled": true,
-    "sound_file": "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga"
+    "sound_file": "/usr/share/sounds/freedesktop/stereo/dialog-warning.oga",
+    "indicator_x": 59,
+    "indicator_y": 92
+
 }
